@@ -11,71 +11,113 @@ namespace Jaeger.Propagation
         public const string TraceParentName = "traceparent";
         public const string TraceStateName = "tracestate";
         public const string TraceStateTracingSystemName = "jaeger";
-        private const int W3CSpecVersion = 0; 
+
+        public const string Version = "00";
+        public const int VersionSize = 2;
+
+        public const char Delimiter = '-';
+
+        public const int DelimiterSize = 1;
+        public const int TraceIdSize = 2 * 16;
+        public const int SpanIdSize = 2 * 8;
+        public const int TraceFlagsSize = 2;
+        public const int MaxTraceStates = 32;
+
+        public const int TraceIdOffset = VersionSize + DelimiterSize;
+        public const int SpanIdOffest = TraceIdOffset + TraceIdSize + DelimiterSize;
+        public const int TraceFlagsOffset = SpanIdOffest + SpanIdSize + DelimiterSize;
+
+        public const int TraceParentHeaderSize = TraceFlagsOffset + TraceFlagsSize;
 
         protected override SpanContext Extract(ITextMap carrier)
         {
-            var traceStateValue = GetTraceStateValue(carrier);
-            
-            if (traceStateValue.ContainsKey(TraceStateTracingSystemName)) {
-                return SpanContext.ContextFromString(traceStateValue[TraceStateTracingSystemName]);
+            string traceParent = null;
+            string debugId = null;
+
+            foreach (var entry in carrier)
+            {
+                if (string.Equals(entry.Key, TraceParentName, StringComparison.OrdinalIgnoreCase))
+                {
+                    traceParent = entry.Value;
+                }
+                else if (string.Equals(entry.Key, Constants.DebugIdHeaderKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    debugId = entry.Value;
+                }
+            }
+            if (traceParent == null)
+            {
+                if (debugId != null)
+                {
+                    return SpanContext.WithDebugId(debugId);
+                }
+                return null;
             }
 
-            return GetSpanContextFromTraceParent(carrier);
+            return GetContextFromParent(traceParent);
+        }
+
+        private SpanContext GetContextFromParent(string traceParent)
+        {
+            if (ValidateTraceParent(traceParent))
+            {
+                var traceId = TraceId.FromString(traceParent.Substring(TraceIdOffset, TraceIdSize));
+                var spanId = SpanId.FromString(traceParent.Substring(SpanIdOffest, SpanIdSize));
+                var flags = ushort.Parse(traceParent.Substring(TraceFlagsOffset, TraceFlagsSize));
+
+                return new SpanContext(traceId, SpanId.NewUniqueId(), spanId, flags == 1 ? SpanContextFlags.Sampled : SpanContextFlags.None);
+            }
+            return null;
+        }
+
+        private bool ValidateTraceParent(string traceParent)
+        {
+            return (
+                traceParent.Length == TraceParentHeaderSize ||
+                (traceParent.Length > TraceParentHeaderSize && traceParent[TraceParentHeaderSize] == '-')
+            )
+            && traceParent[TraceIdOffset - 1] == Delimiter
+            && traceParent[SpanIdOffest - 1] == Delimiter
+            && traceParent[TraceFlagsOffset - 1] == Delimiter;
         }
 
         protected override void Inject(SpanContext spanContext, ITextMap carrier)
         {
-            var commonFormat = $"{W3CSpecVersion:x2}-{spanContext.TraceId}-{spanContext.SpanId}-{((byte)spanContext.Flags):x2}";
-            carrier.Set(TraceParentName, commonFormat);
-            
-            var traceState = GetTraceStateValue(carrier);
-            traceState[TraceStateTracingSystemName] =  spanContext.ToString();
+            string traceParent = $"{Version}{Delimiter}{spanContext.TraceId.ToString()}{Delimiter}" +
+                $"{spanContext.SpanId.ToString()}{Delimiter}" +
+                $"0{(spanContext.IsSampled ? '1' : '0')}";
+            carrier.Set(TraceParentName, traceParent);
 
-            carrier.Set(TraceStateName, BuildTraceStateValue(traceState));
-        }
-
-        // BuildTraceStateValue takes a dictionary and returns the entries as <key>=<value> items seperated by a comma
-        private static string BuildTraceStateValue(Dictionary<string, string> traceStateValueDict)
-        {
-            return string.Join(",", traceStateValueDict.Select(x => $"{ x.Key }={ x.Value }"));
-        }
-
-        // GetTraceStateValue extracts the trace state item from the text map passed in
-        private static Dictionary<string, string> GetTraceStateValue(ITextMap textMap)
-        {
-            // we operate under the assumption that whatever has implemented ITextMap
-            // combines multiple header values into one item similarly to how 
-            // System.Net.WebHeaderCollection operates
-            foreach (var item in textMap)
+            string[] incommingTraceStates = null;
+            foreach (var entry in carrier)
             {
-                if (item.Key.ToLower() == TraceStateName) {
-                    if (!item.Value.Contains('=')) { break; } 
-
-                    return item.Value
-                    .Split(',')
-                    .ToDictionary(x => x.Split('=')[0], x => x.Split('=')[1],  StringComparer.OrdinalIgnoreCase);
-                }
-            }
-
-            return new Dictionary<string, string>();
-        }
-
-        // GetSpanContextFromTraceParent creates a new span context using trace and span
-        // information from the traceparent header. If no info is present null is returned.
-        private static SpanContext GetSpanContextFromTraceParent(ITextMap textMap) 
-        {
-            foreach (var item in textMap)
-            {
-                if (item.Key.ToLower() == TraceParentName)
+                if (string.Equals(entry.Key, TraceStateName, StringComparison.OrdinalIgnoreCase))
                 {
-                    var parentParts = item.Value.Split('-');
-                    var spanContextString = $"{parentParts[1]}:{parentParts[2]}:0:{parentParts[3]}";
-                    return SpanContext.ContextFromString(spanContextString);
+                    incommingTraceStates = entry.Value.Split(',');
                 }
             }
 
-            return null;
+            if (incommingTraceStates.Length < MaxTraceStates)
+            {
+                var spanContexString = spanContext.ContextAsString();
+                if (TraceStateName.Length + spanContexString.Length <= 256)
+                {
+                    var outGoingTraceStates = new List<string> { $"{TraceStateName}={spanContexString}" };
+                    if (incommingTraceStates != null)
+                    {
+                        foreach (var ts in incommingTraceStates)
+                        {
+                            if (!ts.StartsWith(TraceStateTracingSystemName))
+                            {
+                                outGoingTraceStates.Add(ts);
+                            }
+                        }
+                    }
+                    carrier.Set(TraceStateName, string.Join(",", outGoingTraceStates));
+                }
+
+            }
         }
+
     }
 }
